@@ -17,7 +17,6 @@ async function javascriptSitesExample() {
   console.log("\n🔍 Attempt 1: Without JavaScript handling");
   const resultWithoutJS = await scrape(url, {
     formats: ["markdown", "html"],
-    useJsdom: false, // Don't use JSDOM (default)
   });
 
   // Print the result
@@ -44,7 +43,6 @@ async function javascriptSitesExample() {
   console.log("\n🔍 Attempt 2: With JavaScript handling");
   const resultWithJS = await scrape(url, {
     formats: ["markdown", "html"],
-    useJsdom: true, // Enable JSDOM for JavaScript rendering
     actions: [
       // Wait for content to load
       { type: "wait", milliseconds: 1000 },

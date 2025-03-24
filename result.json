@@ -1,0 +1,9 @@
+{
+  "metadata": {
+    "sourceURL": "https://example.com",
+    "statusCode": 200,
+    "title": "Example Domain",
+    "siteName": "example.com"
+  },
+  "markdown": "Example Domain   \n\n# Example Domain\n\nThis domain is for use in illustrative examples in documents. You may use this domain in literature without prior coordination or asking for permission.\n\n[More information...](https://www.iana.org/domains/example)"
+}

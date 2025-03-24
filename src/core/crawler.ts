@@ -7,7 +7,14 @@
 import pLimit from "p-limit";
 import { extractLinks, filterLinks } from "../processors/link-extractor";
 import type { CrawlOptions, CrawlResult, ScrapeResult } from "../types";
+import { createCache } from "../utils/cache";
 import { scrapeUrl } from "./scraper";
+
+// Cache for seen URLs to avoid redundant checks
+const seenUrlsCache = createCache<boolean>(60 * 60 * 1000); // 1 hour cache
+
+// Cache for failed URLs to avoid retrying them repeatedly
+const failedUrlsCache = createCache<string>(15 * 60 * 1000); // 15 minutes cache
 
 interface CrawlState {
   visited: Set<string>;
@@ -17,6 +24,19 @@ interface CrawlState {
   depth: Map<string, number>;
   currentDepth: number;
   pagesProcessed: number;
+  domainCounts: Map<string, number>; // Track domains for rate limiting
+  lastProcessed: Map<string, number>; // Last time a domain was processed
+}
+
+/**
+ * Extracts domain from URL for rate limiting
+ */
+function getDomain(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url; // Fallback
+  }
 }
 
 /**
@@ -30,11 +50,16 @@ export async function crawlUrl(
   const maxDepth = options.maxDepth ?? 3;
   const maxPages = options.maxPages ?? 100;
   const concurrency = options.concurrency ?? 5;
+  const domainDelay = options.domainDelay ?? 200; // ms to wait between requests to same domain
+  const domainConcurrency = options.domainConcurrency ?? 2; // max concurrent requests per domain
 
   if (process.env.DEBUG) {
     console.log(`🕸️ Starting crawl of ${startUrl}`);
     console.log(`🕸️ Max depth: ${maxDepth}, Max pages: ${maxPages}, Concurrency: ${concurrency}`);
   }
+
+  // Clear any previously failed URLs for this crawl
+  failedUrlsCache.clear();
 
   // Initialize crawl state
   const state: CrawlState = {
@@ -45,6 +70,8 @@ export async function crawlUrl(
     depth: new Map<string, number>(),
     currentDepth: 0,
     pagesProcessed: 0,
+    domainCounts: new Map<string, number>(),
+    lastProcessed: new Map<string, number>(),
   };
 
   // Set initial depth for start URL
@@ -58,111 +85,203 @@ export async function crawlUrl(
   // Track which promises have completed
   const completedPromises = new Set<Promise<void>>();
 
-  // Continue until queue is empty or we've hit max pages
-  while (state.pagesProcessed < maxPages) {
-    // Process a batch of URLs from the queue
-    const batch: string[] = [];
+  // Main crawl loop
+  while ((state.pagesProcessed < maxPages) && (state.queue.length > 0 || activePromises.length > 0)) {
+    // Process a batch of URLs from the queue, grouping by domain
+    const domainBatches = new Map<string, string[]>();
 
-    // Take up to concurrency * 2 URLs from the queue
-    while (batch.length < concurrency * 2 && state.queue.length > 0) {
-      const url = state.queue.shift();
+    // Group URLs by domain for controlled concurrency
+    for (let i = 0; i < state.queue.length && domainBatches.size < concurrency; i++) {
+      const url = state.queue[i];
       if (!url) continue;
 
-      // Skip if already visited
-      if (state.visited.has(url)) {
-        if (process.env.DEBUG) {
-          console.log(`🔄 Skipping already visited URL: ${url}`);
-        }
+      const domain = getDomain(url);
+
+      // Skip if already visited or in failed cache
+      if (state.visited.has(url) || failedUrlsCache.has(url)) {
+        // Remove from queue
+        state.queue.splice(i, 1);
+        i--; // Adjust index since we removed an item
         continue;
       }
+
+      // Skip if we're already processing too many URLs from this domain
+      const domainCount = state.domainCounts.get(domain) || 0;
+      if (domainCount >= domainConcurrency) {
+        continue;
+      }
+
+      // Add to domain batch
+      if (!domainBatches.has(domain)) {
+        domainBatches.set(domain, []);
+      }
+      domainBatches.get(domain)?.push(url);
+
+      // Remove from queue
+      state.queue.splice(i, 1);
+      i--; // Adjust index since we removed an item
 
       // Mark as visited
       state.visited.add(url);
-
-      // Get depth of current URL
-      const urlDepth = state.depth.get(url) ?? 0;
-
-      // Skip if we've exceeded max depth
-      if (urlDepth > maxDepth) {
-        if (process.env.DEBUG) {
-          console.log(`🔄 Skipping URL at max depth: ${url} (depth: ${urlDepth})`);
-        }
-        continue;
-      }
-
-      // Add to current batch
-      batch.push(url);
     }
 
-    // If batch is empty and no active promises, we're done
-    if (batch.length === 0 && activePromises.length === 0) {
+    // If no URLs to process but have active promises, wait for some to complete
+    if (domainBatches.size === 0 && activePromises.length > 0) {
       if (process.env.DEBUG) {
-        console.log("🏁 No more URLs to process, finishing crawl");
+        console.log(`⏳ Waiting for ${activePromises.length} active promises to resolve. Queue size: ${state.queue.length}`);
+      }
+
+      // Wait for the next promise to complete
+      try {
+        await Promise.race(activePromises);
+      } catch (error) {
+        // Ignore errors, they're handled in the processing function
+        if (process.env.DEBUG) {
+          console.error("Error in promise race:", error instanceof Error ? error.message : String(error));
+        }
+      }
+
+      // Clean up completed promises - needs to be more robust
+      activePromises = activePromises.filter(p => !completedPromises.has(p));
+      completedPromises.clear();
+
+      continue;
+    }
+
+    // If there are no URLs to process and no active promises, we're done
+    if (domainBatches.size === 0 && activePromises.length === 0) {
+      if (process.env.DEBUG) {
+        console.log("🏁 Crawl complete: No more URLs to process and no active promises");
       }
       break;
     }
 
-    // Process the batch
-    for (const url of batch) {
-      const urlDepth = state.depth.get(url) ?? 0;
+    // Process each domain batch
+    for (const [domain, urls] of domainBatches.entries()) {
+      // Update domain count
+      state.domainCounts.set(domain, (state.domainCounts.get(domain) || 0) + urls.length);
 
-      if (process.env.DEBUG) {
-        console.log(`🕸️ Processing URL: ${url} (depth: ${urlDepth})`);
-      }
+      // Process all URLs in the domain batch sequentially
+      const domainPromise = limit(async () => {
+        try {
+          // Process URLs in sequence for the same domain
+          for (const url of urls) {
+            // Get depth of current URL
+            const urlDepth = state.depth.get(url) ?? 0;
 
-      // Process the URL and add to active promises
-      const processPromise = limit(() => processUrl(url, urlDepth, state, options));
-      activePromises.push(processPromise);
+            // Check if we've exceeded max depth
+            if (urlDepth > maxDepth) {
+              // No need to process this URL
+              if (process.env.DEBUG) {
+                console.log(`🔄 Skipping URL at max depth: ${url} (depth: ${urlDepth})`);
+              }
+              continue;
+            }
+
+            // Rate limiting for domain
+            const lastProcessedTime = state.lastProcessed.get(domain);
+            if (lastProcessedTime) {
+              const timeElapsed = Date.now() - lastProcessedTime;
+              if (timeElapsed < domainDelay) {
+                // Wait before processing next URL from same domain
+                await new Promise(resolve => setTimeout(resolve, domainDelay - timeElapsed));
+              }
+            }
+
+            // Process the URL
+            if (process.env.DEBUG) {
+              console.log(`🕸️ Processing URL: ${url} (depth: ${urlDepth})`);
+            }
+
+            try {
+              await processUrl(url, urlDepth, state, options);
+            } catch (urlError) {
+              // Add to failed cache
+              failedUrlsCache.set(url, urlError instanceof Error ? urlError.message : String(urlError));
+
+              // Add to errors
+              state.errors.push(`Error processing ${url}: ${urlError instanceof Error ? urlError.message : String(urlError)}`);
+
+              if (process.env.DEBUG) {
+                console.error(`❌ Error processing ${url}: ${urlError instanceof Error ? urlError.message : String(urlError)}`);
+              }
+            }
+
+            // Update last processed time
+            state.lastProcessed.set(domain, Date.now());
+          }
+        } finally {
+          // Decrement domain count when all URLs are processed
+          state.domainCounts.set(domain, Math.max(0, (state.domainCounts.get(domain) || 0) - urls.length));
+        }
+      });
 
       // Set up completion tracking
-      processPromise.then(() => {
-        completedPromises.add(processPromise);
+      activePromises.push(domainPromise);
+      domainPromise.then(() => {
+        completedPromises.add(domainPromise);
+      }).catch((error: unknown) => {
+        completedPromises.add(domainPromise);
+        console.error(`Error in domain batch for ${domain}:`, error);
       });
     }
 
-    // If queue is empty or we have lots of active promises, wait for some to complete
-    if (state.queue.length === 0 || activePromises.length > concurrency * 3) {
+    // Check if we have too many active promises
+    if (activePromises.length > concurrency * 2) {
       if (process.env.DEBUG) {
-        console.log(`⏳ Waiting for some promises to resolve (${activePromises.length} active, ${state.queue.length} in queue)`);
+        console.log(`⏳ Too many active promises (${activePromises.length}), waiting for some to complete. Queue size: ${state.queue.length}`);
       }
 
-      // Wait for some promises to complete
-      if (activePromises.length > 0) {
-        // Wait for the next promise to complete or a short timeout
-        await Promise.race([
-          Promise.any(activePromises),
-          new Promise(resolve => setTimeout(resolve, 100))
-        ]);
-
-        // Clean up completed promises
-        activePromises = activePromises.filter(p => !completedPromises.has(p));
-        completedPromises.clear();
-      } else {
-        // No active promises but queue is empty, we're done
-        break;
+      // Wait for any promise to complete
+      try {
+        await Promise.race(activePromises);
+      } catch (error) {
+        // Ignore errors, they're handled in the processing function
+        if (process.env.DEBUG) {
+          console.error("Error in promise race:", error instanceof Error ? error.message : String(error));
+        }
       }
+
+      // Clean up completed promises
+      activePromises = activePromises.filter(p => !completedPromises.has(p));
+      completedPromises.clear();
     }
   }
 
   // Wait for all remaining promises to complete
   if (activePromises.length > 0) {
     if (process.env.DEBUG) {
-      console.log(`⏳ Waiting for final ${activePromises.length} promises to resolve`);
+      console.log(`⏳ Waiting for final ${activePromises.length} promises to resolve. Queue size: ${state.queue.length}`);
     }
-    await Promise.all(activePromises);
+
+    // Wait for all promises to complete, even if some fail
+    if (activePromises.length > 0) {
+      await Promise.allSettled(activePromises);
+    }
+  }
+
+  // One final check of the queue - if it's not empty, there's an issue with the crawl logic
+  if (state.queue.length > 0) {
+    if (process.env.DEBUG) {
+      console.log(`⚠️ Queue is not empty after all promises resolved. This indicates we've hit maxPages limit or there's an issue with filtering.`);
+      console.log(`⚠️ ${state.queue.length} URLs left in queue. First few: ${state.queue.slice(0, 3).join(', ')}...`);
+    }
   }
 
   if (process.env.DEBUG) {
-    console.log(`✅ Crawl completed. Visited ${state.visited.size} URLs, processed ${state.results.length} pages`);
+    console.log(`✅ Crawl completed. Visited ${state.visited.size} URLs, processed ${state.pagesProcessed} pages`);
+    console.log(`Remaining queue: ${state.queue.length} items`);
+    console.log(`Cache stats - Seen URLs: ${seenUrlsCache.stats().size}, Failed URLs: ${failedUrlsCache.stats().size}`);
   }
 
   return {
     success: state.errors.length === 0,
     error: state.errors.length > 0 ? state.errors.join("; ") : undefined,
-    status: "completed",
-    total: state.visited.size,
-    completed: state.results.length,
+    status: state.queue.length > 0 ? "incomplete" : "completed",
+    total: state.visited.size + state.queue.length, // Include queued items in total
+    completed: state.pagesProcessed,
     data: state.results,
+    remaining: state.queue.length,
   };
 }
 
@@ -178,6 +297,14 @@ async function processUrl(
   try {
     if (process.env.DEBUG) {
       console.log(`🔍 Processing URL: ${url} (depth: ${depth})`);
+    }
+
+    // Check if we already have an error for this URL
+    if (failedUrlsCache.has(url)) {
+      if (process.env.DEBUG) {
+        console.log(`🚫 Skipping previously failed URL: ${url}`);
+      }
+      return;
     }
 
     // Scrape the URL
@@ -222,15 +349,37 @@ async function processUrl(
         // Add unvisited links to queue with increased depth
         let addedLinks = 0;
         for (const link of filteredLinks) {
-          if (!state.visited.has(link)) {
-            state.queue.push(link);
-            state.depth.set(link, depth + 1);
-            addedLinks++;
-            if (process.env.DEBUG) {
-              console.log(`➕ Added to queue: ${link} (depth ${depth + 1})`);
+          // Normalize URL to avoid duplicates
+          try {
+            const normalizedUrl = new URL(link).toString();
+
+            // Skip if already visited or in the queue
+            if (
+              state.visited.has(normalizedUrl) ||
+              state.queue.includes(normalizedUrl) ||
+              failedUrlsCache.has(normalizedUrl) ||
+              seenUrlsCache.has(normalizedUrl)
+            ) {
+              if (process.env.DEBUG) {
+                console.log(`🔄 Already processed or queued, skipping: ${normalizedUrl}`);
+              }
+              continue;
             }
-          } else if (process.env.DEBUG) {
-            console.log(`🔄 Already visited, not queueing: ${link}`);
+
+            // Add to queue and mark seen
+            state.queue.push(normalizedUrl);
+            state.depth.set(normalizedUrl, depth + 1);
+            seenUrlsCache.set(normalizedUrl, true);
+            addedLinks++;
+
+            if (process.env.DEBUG && addedLinks <= 5) { // Limit log noise
+              console.log(`➕ Added to queue: ${normalizedUrl} (depth ${depth + 1})`);
+            }
+          } catch (urlError) {
+            // Skip invalid URLs
+            if (process.env.DEBUG) {
+              console.log(`⚠️ Invalid URL: ${link}`);
+            }
           }
         }
 
@@ -242,12 +391,18 @@ async function processUrl(
         console.log(`Max depth reached or no links found for ${url} (depth: ${depth})`);
       }
     } else if (scrapeResult.error) {
+      // Add to failed URLs cache
+      failedUrlsCache.set(url, scrapeResult.error);
+
       state.errors.push(scrapeResult.error);
       if (process.env.DEBUG) {
         console.error(`❌ Error processing ${url}: ${scrapeResult.error}`);
       }
     }
   } catch (error) {
+    // Add to failed URLs cache
+    failedUrlsCache.set(url, error instanceof Error ? error.message : String(error));
+
     if (error instanceof Error) {
       state.errors.push(`Failed to process ${url}: ${error.message}`);
       if (process.env.DEBUG) {

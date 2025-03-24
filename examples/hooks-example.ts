@@ -22,7 +22,7 @@ async function hooksExample() {
   }
 
   // Define the starting URL and crawl configuration
-  const startUrl = "https://docs.unity3d.com/Packages/com.unity.entities@1.4/manual/index.html";
+  const startUrl = "https://docs.unity3d.com/Packages/com.unity.netcode@1.5/manual/index.html";
 
   console.log("Starting crawl with URL:", startUrl);
 
@@ -41,7 +41,7 @@ async function hooksExample() {
       formats: ["markdown", "links"],
       // Unity docs specific patterns - this is crucial
       includePatterns: [
-        "com.unity.entities@1.4/*",
+        "com.unity.netcode@1.5/*",
       ],
       allowExternalDomains: false,
       concurrency: 3, // Lower concurrency to avoid overwhelming

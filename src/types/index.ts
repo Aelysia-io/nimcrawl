@@ -2,6 +2,8 @@
  * Core types for the nimcrawl crawler
  */
 
+import type { ExtractedData, ExtractionSchema, OllamaModelOptions } from "../utils/llm-processor";
+
 export interface FetchOptions {
   headers?: Record<string, string>;
   timeout?: number;
@@ -20,19 +22,21 @@ export interface CrawlOptions {
   concurrency?: number;
   fetchOptions?: FetchOptions;
   formats?: OutputFormat[];
-  beforeTransform?: (result: ScrapeResult) => Promise<ScrapeResult> | ScrapeResult;
-  afterTransform?: (result: ScrapeResult) => Promise<ScrapeResult> | ScrapeResult;
+  beforeTransform?: (result: ScrapeResult) => void;
+  afterTransform?: (result: ScrapeResult) => void;
+  domainDelay?: number;
+  domainConcurrency?: number;
 }
 
 export interface ScrapeOptions {
   formats?: OutputFormat[];
-  useJsdom?: boolean;
   extractMetadata?: boolean;
   extractLinks?: boolean;
   actions?: Action[];
   location?: LocationOptions;
-  beforeTransform?: (result: ScrapeResult) => Promise<ScrapeResult> | ScrapeResult;
-  afterTransform?: (result: ScrapeResult) => Promise<ScrapeResult> | ScrapeResult;
+  beforeTransform?: (result: ScrapeResult) => void;
+  afterTransform?: (result: ScrapeResult) => void;
+  extractOptions?: ExtractOptions;
 }
 
 export interface LocationOptions {
@@ -56,10 +60,26 @@ export interface Action {
   milliseconds?: number;
 }
 
+/**
+ * Options for extracting structured data using LLMs
+ */
 export interface ExtractOptions {
-  schema?: Record<string, string | number | boolean | object | null>;
+  schema?: ExtractionSchema;
   systemPrompt?: string;
   prompt?: string;
+  model?: string;
+  ollamaHost?: string;
+  modelOptions?: OllamaModelOptions;
+}
+
+/**
+ * Result of LLM-based extraction
+ */
+export interface ExtractResult {
+  success: boolean;
+  data?: ExtractedData;
+  error?: string;
+  rawResponse?: string;
 }
 
 export interface PageMetadata {
@@ -74,6 +94,13 @@ export interface PageMetadata {
   ogImage?: string;
   ogLocaleAlternate?: string[];
   ogSiteName?: string;
+  // Twitter card metadata
+  twitterTitle?: string;
+  twitterDescription?: string;
+  twitterImage?: string;
+  twitterCard?: string;
+  // Site information
+  siteName?: string;
   sourceURL: string;
   statusCode: number;
 }
@@ -87,7 +114,7 @@ export interface ScrapeResult {
     rawHtml?: string;
     screenshot?: string;
     links?: string[];
-    extract?: Record<string, string | number | boolean | object | null>;
+    extract?: ExtractedData;
     metadata?: PageMetadata;
   };
 }
@@ -95,10 +122,11 @@ export interface ScrapeResult {
 export interface CrawlResult {
   success: boolean;
   error?: string;
-  status: "completed" | "scraping" | "failed";
+  status: "completed" | "scraping" | "failed" | "incomplete";
   total: number;
   completed: number;
   data: Array<ScrapeResult["data"]>;
+  remaining?: number;
 }
 
 export interface ContentType {
